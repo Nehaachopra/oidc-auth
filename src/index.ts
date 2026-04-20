@@ -1,11 +1,11 @@
 import crypto from "node:crypto";
 import express from "express";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import JWT from "jsonwebtoken";
 import jose from "node-jose";
 import { db } from "./db";
-import { usersTable } from "./db/schema";
+import { usersTable,clientsTable, authorizationCodesTable } from "./db/schema";
 import { PRIVATE_KEY, PUBLIC_KEY } from "./utils/cert";
 import type { JWTClaims } from "./utils/user-token";
 
@@ -27,6 +27,7 @@ app.get("/.well-known/openid-configuration", (req, res) => {
   return res.json({
     issuer: ISSUER,
     authorization_endpoint: `${ISSUER}/o/authenticate`,
+    token_endpoint: `${ISSUER}/o/token`,
     userinfo_endpoint: `${ISSUER}/o/userinfo`,
     jwks_uri: `${ISSUER}/.well-known/jwks.json`,
   });
@@ -42,11 +43,14 @@ app.get("/o/authenticate", (req, res) => {
 });
 
 app.post("/o/authenticate/sign-in", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, client_id, redirect_uri, state, nonce } = req.body;
 
   if (!email || !password) {
     res.status(400).json({ message: "Email and password are required." });
     return;
+  }
+  if (!client_id || !redirect_uri || !state || !nonce) {
+    res.status(400).json({message: "Client id and redirect uri required!"})
   }
 
   const [user] = await db
@@ -70,6 +74,100 @@ app.post("/o/authenticate/sign-in", async (req, res) => {
     return;
   }
 
+  const [client] = await db.select().from(clientsTable)
+  .where(
+    and(
+      eq(clientsTable.clientId, client_id),
+      eq(clientsTable.redirectURI, redirect_uri)
+    ))
+  
+  if (!client) {
+    res.status(401).json({ message: "Invalid client id or redirect uri" });
+    return;
+  }
+
+  const authorizationCode = crypto.randomBytes(32).toString("hex");
+  const hashedCode = crypto.createHash('sha256').update(authorizationCode).digest('hex');
+  const expiresAt = new Date(Date.now() + 60 * 60  * 1000);
+
+  await db.insert(authorizationCodesTable).values({
+    code: hashedCode,
+    clientId: client_id,
+    userId: user.id,
+    redirectUri: redirect_uri,
+    state,
+    nonce,
+    expiresAt
+  })
+
+  const redirectURL = `${redirect_uri}?code=${authorizationCode}&state=${state}`;
+
+  return res.json(200).json({
+    redirect: redirectURL
+  });
+});
+
+app.post("/o/token", async (req, res) => {
+  const {code, client_secret} = req.body;
+
+  if (!code || !client_secret) {
+    return res.status(400).json({
+      message: "Authorization code and client secret required"
+    })
+  }
+
+  const hashedCode= crypto.createHash('sha256').update(code).digest('hex');
+  const hashedSecret = crypto.createHash('sha256').update(client_secret).digest('hex');
+
+  const [result] = await db
+  .select()
+  .from(authorizationCodesTable)
+  .leftJoin(clientsTable, 
+    eq(authorizationCodesTable.clientId, clientsTable.clientId)
+  )
+  .where(
+    eq(authorizationCodesTable.code, hashedCode),
+  )
+  .limit(1)
+
+  if (!result) {
+    return res.status(401).json({
+      message: "Invalid authorization code or secret key."
+    })
+  }
+
+  if (new Date() > result.authorization_codes.expiresAt) {
+    return res.status(401).json({
+      message: "Authorization code expired"
+    })
+  }
+
+  const isValid = crypto.timingSafeEqual(
+    Buffer.from(hashedSecret, "hex"),
+    Buffer.from(result.clients.clientSecret, "hex")
+  );
+
+  if (!isValid) {
+    return res.status(401).json({
+      message: "Invalid authorization code or secret key."
+    })
+  }
+
+  const [user] = await db
+  .select()
+  .from(usersTable)
+  .where(eq(usersTable.id, result.authorization_codes.userId));
+
+  if (!user) {
+    return res.status(500).json({
+      message: "We commited mistake in storing users data"
+    })
+  }
+
+  await db
+  .delete(authorizationCodesTable)
+  .where(eq(authorizationCodesTable.code, hashedCode));
+
   const ISSUER = `http://localhost:${PORT}`;
   const now = Math.floor(Date.now() / 1000);
 
@@ -88,7 +186,7 @@ app.post("/o/authenticate/sign-in", async (req, res) => {
   const token = JWT.sign(claims, PRIVATE_KEY, { algorithm: "RS256" });
 
   res.json({ token });
-});
+})
 
 app.post("/o/authenticate/sign-up", async (req, res) => {
   const { firstName, lastName, email, password } = req.body;
@@ -173,6 +271,47 @@ app.get("/o/userinfo", async (req, res) => {
     picture: user.profileImageURL,
   });
 });
+
+app.get("/o/client-details", (req, res) => {
+  return res.sendFile(path.resolve("public", "authenticate.html"));
+})
+
+app.post("/o/client-details", async (req, res) => {
+  const {appName, applicationURL, redirectURI} = req.body;
+  if (!appName || !applicationURL || !redirectURI) return res.status(400).json({ message: "App name, application url and redirect uri are required." });
+  
+  const [client] = await db
+    .select()
+    .from(clientsTable)
+    .where(
+      and(
+        eq(clientsTable.applicationURL, applicationURL)
+      )
+    )
+    .limit(1);
+
+  if (client) {
+    res.status(401).json({ message: "Client already registered." });
+    return;
+  }
+
+  const clientId = crypto.randomBytes(16).toString("hex");
+  const clientSecret =  crypto.randomBytes(32).toString("hex");
+  const hashedSecret = crypto.createHash("sha256").update(clientSecret).digest("hex");
+
+  await db.insert(clientsTable).values({
+    applicationDisplayName: appName,
+    applicationURL,
+    redirectURI,
+    clientId,
+    clientSecret: hashedSecret
+  })
+
+  res.json({
+    clientId,
+    clientSecret
+  })
+})
 
 app.listen(PORT, () => {
   console.log(`AuthServer is running on PORT ${PORT}`);
